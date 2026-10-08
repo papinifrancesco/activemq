@@ -51,7 +51,9 @@ import org.junit.rules.Timeout;
 /**
  * The JDBC store acks a durable subscription by moving its last acked id, so expiring a message
  * acks every earlier message of that subscription too. Expiring a message that follows a
- * non-expired one must not make the non-expired message disappear.
+ * non-expired one must not make the non-expired message disappear, and expiring a message the
+ * subscription has already consumed must not move its last acked id back, which would deliver
+ * the later consumed messages again.
  */
 @Category(ParallelTest.class)
 public class JDBCDurableSubExpirationOrderTest {
@@ -220,6 +222,75 @@ public class JDBCDurableSubExpirationOrderTest {
 
             TopicSubscriber subscriber = session.createDurableSubscriber(topic, "sub1");
             assertNull(subscriber.receive(500));
+        } finally {
+            connection.close();
+        }
+    }
+
+    // A message the subscription has already consumed stays in the table until the cleanup deletes
+    // it (for non-prioritized messages, every 10th cleanup period). When it expires while the
+    // subscription is offline, the expiry task must not ack it again: that would move the last
+    // acked id back, and the later message, consumed too, would be delivered again after a restart.
+    @Test
+    public void testExpiredConsumedMessageIsNotDeliveredAgain() throws Exception {
+        startBroker(true);
+        consumeTtlThenNoTtl();
+
+        // let the expiry task run several times after the consumed message expired
+        Thread.sleep(2500);
+        long expired = broker.getDestination(topic).getDestinationStatistics().getExpired().getCount();
+
+        TextMessage again = restartAndReceive(200);
+        assertNull("consumed message delivered again: " + (again == null ? "" : again.getText()), again);
+        assertEquals("consumed message counted as expired", 0, expired);
+    }
+
+    // browsing the topic (e.g. over JMX) must not ack a consumed message again either
+    @Test
+    public void testBrowseDoesNotDeliverConsumedMessageAgain() throws Exception {
+        startBroker(true, 0);
+        consumeTtlThenNoTtl();
+        Thread.sleep(1500);
+
+        broker.getDestination(topic).browse();
+        long expired = broker.getDestination(topic).getDestinationStatistics().getExpired().getCount();
+
+        TextMessage again = restartAndReceive(0);
+        assertNull("consumed message delivered again: " + (again == null ? "" : again.getText()), again);
+        assertEquals("consumed message counted as expired", 0, expired);
+    }
+
+    // the subscription consumes a message with a 1 s TTL and a later one without, then goes offline
+    private void consumeTtlThenNoTtl() throws Exception {
+        Connection connection = connect();
+        try {
+            Session session = connection.createSession(false, Session.AUTO_ACKNOWLEDGE);
+            TopicSubscriber subscriber = session.createDurableSubscriber(topic, "sub1");
+            MessageProducer producer = session.createProducer(topic);
+            producer.send(session.createTextMessage("ttl"), DeliveryMode.PERSISTENT, Message.DEFAULT_PRIORITY, 1000);
+            producer.send(session.createTextMessage("no-ttl"), DeliveryMode.PERSISTENT, Message.DEFAULT_PRIORITY, 0);
+            TextMessage received = (TextMessage) subscriber.receive(5000);
+            assertNotNull(received);
+            assertEquals("ttl", received.getText());
+            received = (TextMessage) subscriber.receive(5000);
+            assertNotNull(received);
+            assertEquals("no-ttl", received.getText());
+        } finally {
+            connection.close();
+        }
+    }
+
+    // restart so the subscription is recovered from the database, then reconnect it
+    private TextMessage restartAndReceive(long expireMessagesPeriod) throws Exception {
+        broker.stop();
+        broker.waitUntilStopped();
+        startBroker(false, expireMessagesPeriod);
+
+        Connection connection = connect();
+        try {
+            Session session = connection.createSession(false, Session.AUTO_ACKNOWLEDGE);
+            TopicSubscriber subscriber = session.createDurableSubscriber(topic, "sub1");
+            return (TextMessage) subscriber.receive(2000);
         } finally {
             connection.close();
         }
